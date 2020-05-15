@@ -2,9 +2,9 @@
 """Unittesting for the pyross module. Run as python -m unittest pyross.test."""
 import sys
 #remove pwd from path that tries to import .pyx files
-for i in sys.path:
-    if 'pyross' in i or i == '':
-        sys.path.remove(i)
+# for i in sys.path:
+#     if 'pyross' in i or i == '':
+#         sys.path.remove(i)
 # print(sys.path)
 import pyross
 import unittest
@@ -24,6 +24,9 @@ class DeterministicTest(unittest.TestCase):
     gI = 0.008
     gE = 0.007
     gIc = 0.1
+    gIhp= 0.1
+    gIsp= 0.1
+    gIcp= 0.1
     gIh = 0.1
     gA = 0
     tE = 0
@@ -48,6 +51,7 @@ class DeterministicTest(unittest.TestCase):
     ep = 0
     parameters = {'N': N, 'M': M, 'alpha': alpha,
                           'beta': beta, 'gIa': gIa, 'gIs': gIs,
+                          'gIsp':gIsp,'gIhp':gIhp,'gIcp':gIcp,
                           'gI': gI, 'iaa': iaa,
                           'gE': gE, 'gA': gA, 'tE': tE,
                           'gIc': gIc, 'gIh': gIh, 'fh': fh,
@@ -124,7 +128,7 @@ class DeterministicTest(unittest.TestCase):
         deterministic_models = dict(inspect.getmembers(pyross.deterministic,
                                                        inspect.isclass))
         for name, model in deterministic_models.items():
-            if name.startswith('S'):
+            if name.startswith('S') and not 'Spp':
                 m = model(self.parameters, self.M, self.N)
 
     def test_run_models(self):
@@ -133,7 +137,7 @@ class DeterministicTest(unittest.TestCase):
                                                        inspect.isclass))
         traj_dict={}
         for name, model in deterministic_models.items():
-            if name.startswith('S'):
+            if name.startswith('S') and not 'Spp':
                 m = model(self.parameters, self.M, self.N)
                 x0 = np.array([*self.N, *np.ones(self.M),
                                *np.zeros(m.nClass -2)], dtype=np.float64).reshape((m.nClass,1))

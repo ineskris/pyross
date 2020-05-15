@@ -1,3 +1,4 @@
+from itertools import compress
 from scipy import sparse
 from scipy.integrate import odeint
 from scipy.optimize import minimize, approx_fprime
@@ -10,7 +11,6 @@ cimport cython
 import pyross.deterministic
 cimport pyross.deterministic
 import pyross.contactMatrix
-from pyross.utils import BoundedSteps
 from pyross.utils_python import minimization
 from libc.math cimport sqrt, log, INFINITY
 cdef double PI = 3.14159265359
@@ -41,8 +41,8 @@ cdef class SIR_type:
         nClass * M.
     fi : np.array(M)
         Age group size as a fraction of total population
-    alpha : float
-        Fraction of infected who are asymptomatic.
+    alpha : float or np.array(M)
+        Fraction of infected who are asymptomatic (possibly age-dependent).
     beta : float
         Rate of spread of infection.
     gIa : float
@@ -73,8 +73,8 @@ cdef class SIR_type:
     '''
     cdef:
         readonly Py_ssize_t nClass, N, M, steps, dim, vec_size
-        readonly double alpha, beta, gIa, gIs, fsa
-        readonly np.ndarray fi, CM, dsigmadt, J, B, J_mat, B_vec, U
+        readonly beta, gIa, gIs, fsa
+        readonly np.ndarray alpha, fi, CM, dsigmadt, J, B, J_mat, B_vec, U
         readonly np.ndarray flat_indices1, flat_indices2, flat_indices, rows, cols
 
 
@@ -186,30 +186,49 @@ cdef class SIR_type:
         estimates[1] /= beta_rescale
         return estimates
 
-    def _infer_parameters_to_minimize(self, params, grad=0, keys=None, bounds=None, eps=None, x=None, Tf=None, Nf=None,
+    def _infer_parameters_to_minimize(self, params, grad=0, keys=None, is_scale_parameter=None, scaled_guesses=None,
+                               flat_guess_range=None, eps=None, x=None, Tf=None, Nf=None,
                                contactMatrix=None, a=None, scale=None):
         """Objective function for minimization call in infer_parameters."""
-        parameters = self.fill_params_dict(keys, params)
+        # Restore parameters from flattened parameters
+        orig_params = []
+        k=0
+        for j in range(len(flat_guess_range)):
+            if is_scale_parameter[j]:
+                orig_params.append(np.array([params[flat_guess_range[j]]*val for val in scaled_guesses[k]]))
+                k += 1
+            else:
+                orig_params.append(params[flat_guess_range[j]])
+
+        parameters = self.fill_params_dict(keys, orig_params)
         self.set_params(parameters)
         model = self.make_det_model(parameters)
         minus_logp = self.obtain_log_p_for_traj(x, Tf, Nf, model, contactMatrix)
         minus_logp -= np.sum(gamma.logpdf(params, a, scale=scale))
         return minus_logp
 
-    def infer_parameters(self, keys, np.ndarray guess, np.ndarray stds, np.ndarray bounds, np.ndarray x,
-                        double Tf, double Nf, contactMatrix, verbose=False,
+    def infer_parameters(self, keys, guess, stds, bounds, np.ndarray x,
+                        double Tf, double Nf, contactMatrix, infer_scale_parameter=False, verbose=False,
                         ftol=1e-6, eps=1e-5, global_max_iter=100, local_max_iter=100, global_ftol_factor=10.,
                         enable_global=True, enable_local=True, cma_processes=0, cma_population=16, cma_stds=None):
         '''
         Compute the maximum a-posteriori (MAP) estimate of the parameters of the SIR type model. This function
         assumes that full data on all classes is available (with latent variables, use SIR_type.latent_inference).
 
+        IN DEVELOPMENT: Parameters that support age-dependent values can be inferred age-dependently by setting the guess
+        to a numpy.array of self.M initial values. By default, each age-dependent parameter is inferred independently.
+        If the relation of the different parameters is known, a scale factor of the initial guess can be inferred instead
+        by setting infer_scale_parameter to True for each age-dependent parameter where this is wanted. Note that
+        computing hessians for age-dependent rates is not yet supported. This functionality might be changed in the
+        future without warning.
+
         Parameters
         ----------
         keys: list
             A list of names for parameters to be inferred
         guess: numpy.array
-            Prior expectation (and initial guess) for the parameter values.
+            Prior expectation (and initial guess) for the parameter values. For parameters that support it, age-dependent
+            rates can be inferred by supplying a guess that is an array instead a single float.
         stds: numpy.array
             Standard deviations for the Gamma prior of the parameters
         bounds: 2d numpy.array
@@ -222,6 +241,10 @@ cdef class SIR_type:
             Number of data points along the trajectory
         contactMatrix: callable
             A function that returns the contact matrix at time t (input).
+        infer_scale_parameter: bool or list of bools (size: number of age-dependenly specified parameters)
+            Decide if age-dependent parameters are supposed to be inferred separately (default) or if a scale parameter
+            for the guess should be inferred. This can be set either globally for all age-dependent parameters or for each
+            age-dependent parameter individually
         verbose: bool, optional
             Set to True to see intermediate outputs from the optimizer.
         ftol: double
@@ -238,20 +261,81 @@ cdef class SIR_type:
         estimates : numpy.array
         the MAP parameter estimate
         '''
-        a, scale = pyross.utils.make_gamma_dist(guess, stds)
+        # Deal with age-dependent rates: Transfer the supplied guess to a flat guess where the age dependent rates are either listed
+        # as multiple parameters (infer_scale_parameter is False) or replaced by a scaling factor with initial value 1.0
+        # (infer_scale_parameter is True).
+        age_dependent = np.array([hasattr(g, "__len__") for g in guess], dtype=np.bool)  # Select all guesses with more than 1 entry
+        n_age_dep = np.sum(age_dependent)
+        if not hasattr(infer_scale_parameter, "__len__"):
+            # infer_scale_parameter can be either set for all age-dependent parameters or individually
+            infer_scale_parameter = np.array([infer_scale_parameter]*n_age_dep, dtype=np.bool)
+        is_scale_parameter = np.zeros(len(guess), dtype=np.bool)
+        k = 0
+        for j in range(len(guess)):
+            if age_dependent[j]:
+                is_scale_parameter[j] = infer_scale_parameter[k]
+                k += 1
+
+        n_scaled_age_dep = np.sum(infer_scale_parameter)
+        flat_guess_size  = len(guess) - n_age_dep + self.M * (n_age_dep - n_scaled_age_dep) + n_scaled_age_dep
+
+        # Define a new flat guess and a list of slices that correspond to the intitial guess
+        flat_guess       = np.zeros(flat_guess_size)
+        flat_stds        = np.zeros(flat_guess_size)
+        flat_bounds      = np.zeros((flat_guess_size, 2))
+        flat_guess_range = []  # Indicates the position(s) in flat_guess that each parameter corresponds to
+        scaled_guesses   = []  # Store the age-dependent guesses where we infer a scale parameter in this list
+        i = 0; j = 0
+        while i < flat_guess_size:
+            if age_dependent[j] and is_scale_parameter[j]:
+                flat_guess[i]    = 1.0          # Initial guess for the scaling parameter
+                flat_stds[i]     = stds[j]      # Assume that suitable std. deviation for scaling factor and bounds are
+                flat_bounds[i,:] = bounds[j,:]  # provided by the user (only one bound for age-dependent parameters possible).
+                scaled_guesses.append(guess[j])
+                flat_guess_range.append(i)
+                i += 1
+            elif age_dependent[j]:
+                flat_guess[i:i+self.M]    = guess[j]
+                flat_stds[i:i+self.M]     = stds[j]
+                flat_bounds[i:i+self.M,:] = bounds[j,:]
+                flat_guess_range.append(list(range(i, i+self.M)))
+                i += self.M
+            else:
+                flat_guess[i]    = guess[j]
+                flat_stds[i]     = stds[j]
+                flat_bounds[i,:] = bounds[j,:]
+                flat_guess_range.append(i)
+                i += 1
+            j += 1
+
+        a, scale = pyross.utils.make_gamma_dist(flat_guess, flat_stds)
 
         if cma_stds is None:
             # Use prior standard deviations here
-            cma_stds = stds
+            flat_cma_stds = flat_stds
+        else:
+            flat_cma_stds = np.zeros(flat_guess_size)
+            for i in range(len(guess)):
+                flat_cma_stds[flat_guess_range[i]] = cma_stds[i]
 
-        minimize_args={'keys':keys, 'bounds':bounds, 'eps':eps, 'x':x, 'Tf':Tf, 'Nf':Nf,
-                         'contactMatrix':contactMatrix, 'a':a, 'scale':scale}
-        res = minimization(self._infer_parameters_to_minimize, guess, bounds, ftol=ftol, global_max_iter=global_max_iter,
+        minimize_args={'keys':keys, 'is_scale_parameter':is_scale_parameter, 'scaled_guesses':scaled_guesses, 'flat_guess_range':flat_guess_range,
+                       'eps':eps, 'x':x, 'Tf':Tf, 'Nf':Nf, 'contactMatrix':contactMatrix, 'a':a, 'scale':scale}
+        res = minimization(self._infer_parameters_to_minimize, flat_guess, flat_bounds, ftol=ftol, global_max_iter=global_max_iter,
                            local_max_iter=local_max_iter, global_ftol_factor=global_ftol_factor,
                            enable_global=enable_global, enable_local=enable_local, cma_processes=cma_processes,
-                           cma_population=cma_population, cma_stds=cma_stds, verbose=verbose, args_dict=minimize_args)
-        estimates = res[0]
-        return estimates
+                           cma_population=cma_population, cma_stds=flat_cma_stds, verbose=verbose, args_dict=minimize_args)
+        params = res[0]
+        # Restore parameters from flattened parameters
+        orig_params = []
+        k=0
+        for j in range(len(flat_guess_range)):
+            if is_scale_parameter[j]:
+                orig_params.append(np.array([params[flat_guess_range[j]]*val for val in scaled_guesses[k]]))
+                k += 1
+            else:
+                orig_params.append(params[flat_guess_range[j]])
+
+        return np.array(orig_params)
 
 
     def _infer_control_to_minimize(self, params, grad=0, bounds=None, eps=None, x=None, Tf=None, Nf=None, generator=None,
@@ -454,6 +538,7 @@ cdef class SIR_type:
                             enable_global=True, enable_local=True, cma_processes=0,
                             cma_population=16, cma_stds=None):
         """
+        DEPRECATED. Use latent_infer_parameters instead.
         Compute the maximum a-posteriori (MAP) estimate of the parameters and the initial conditions of a SIR type model
         when the classes are only partially observed. Unobserved classes are treated as latent variables.
 
@@ -522,6 +607,94 @@ cdef class SIR_type:
         params[param_dim:] /= rescale_factor
         params[1] /= beta_rescale
         return params
+
+    def _latent_infer_parameters_to_minimize(self, params, grad = 0, param_keys=None, init_fltr=None, bounds=None, param_dim=None,
+                obs=None, fltr=None, Tf=None, Nf=None, contactMatrix=None, a=None, scale=None):
+        """Objective function for minimization call in laten_inference."""
+        inits =  np.copy(params[param_dim:])
+        parameters = self.fill_params_dict(param_keys, params[:param_dim])
+        self.set_params(parameters)
+        model = self.make_det_model(parameters)
+        x0 = self.fill_initial_conditions(inits, obs[0], init_fltr, fltr)
+        minus_logp = self.obtain_log_p_for_traj_matrix_fltr(x0, obs[1:], fltr, Tf, Nf, model, contactMatrix)
+        minus_logp -= np.sum(gamma.logpdf(params, a, scale=scale))
+        return minus_logp
+
+
+    def latent_infer_parameters(self, param_keys, np.ndarray init_fltr, np.ndarray guess, np.ndarray stds, np.ndarray obs, np.ndarray fltr,
+                            double Tf, Py_ssize_t Nf, contactMatrix, np.ndarray bounds,
+                            verbose=False, double ftol=1e-5,
+                            global_max_iter=100, local_max_iter=100, global_ftol_factor=10.,
+                            enable_global=True, enable_local=True, cma_processes=0,
+                            cma_population=16, cma_stds=None):
+        """
+        Compute the maximum a-posteriori (MAP) estimate of the parameters and the initial conditions of a SIR type model
+        when the classes are only partially observed. Unobserved classes are treated as latent variables.
+
+        Parameters
+        ----------
+        param_keys: list
+            A list of parameters to be inferred.
+        init_fltr: boolean array
+            True for initial conditions to be inferred.
+            Shape = (nClass*M)
+            Total number of True = total no. of variables - total no. of observed
+        guess: numpy.array
+            Prior expectation for the parameter values listed, and prior for initial conditions.
+            Expect of length len(param_keys)+ (total no. of variables - total no. of observed)
+        stds: numpy.array
+            Standard deviations for the Gamma prior.
+        obs: 2d numpy.array
+            The observed trajectories with reduced number of variables
+            (number of data points, (age groups * observed model classes))
+        fltr: 2d numpy.array
+            A matrix of shape (no. observed variables, no. total variables),
+            such that obs_{ti} = fltr_{ij} * X_{tj}
+        Tf: float
+            Total time of the trajectory
+        Nf: int
+            Total number of data points along the trajectory
+        contactMatrix: callable
+            A function that returns the contact matrix at time t (input).
+        bounds: 2d numpy.array
+            Bounds for the parameters + initial conditions
+            ((number of parameters + number of initial conditions) x 2).
+            Better bounds makes it easier to find the true global minimum.
+        verbose: bool, optional
+            Set to True to see intermediate outputs from the optimizer.
+        ftol: float, optional
+            Relative tolerance
+        global_max_iter, local_max_iter, global_ftol_factor, enable_global, enable_local, cma_processes,
+                    cma_population, cma_stds:
+            Parameters of `minimization` function in `utils_python.py` which are documented there. If not
+            specified, `cma_stds` is set to `stds`.
+
+        Returns
+        -------
+        params: numpy.array
+            MAP estimate of paramters and initial values of the classes.
+        """
+        cdef:
+            Py_ssize_t param_dim = len(param_keys)
+        assert int(np.sum(init_fltr)) == self.dim - fltr.shape[0]
+        assert guess.shape[0] == param_dim + int(np.sum(init_fltr)), 'len(guess) must equal to total number of params + inits to be inferred'
+        a, scale = pyross.utils.make_gamma_dist(guess, stds)
+
+        if cma_stds is None:
+            # Use prior standard deviations here
+            cma_stds = stds
+
+        minimize_args = {'param_keys':param_keys, 'init_fltr':init_fltr, 'bounds':bounds, 'param_dim':param_dim,
+                         'obs':obs, 'fltr':fltr, 'Tf':Tf, 'Nf':Nf, 'contactMatrix':contactMatrix,
+                         'a':a, 'scale':scale}
+        res = minimization(self._latent_infer_parameters_to_minimize, guess, bounds, ftol=ftol, global_max_iter=global_max_iter,
+                           local_max_iter=local_max_iter, global_ftol_factor=global_ftol_factor,
+                           enable_global=enable_global, enable_local=enable_local, cma_processes=cma_processes,
+                           cma_population=cma_population, cma_stds=cma_stds, verbose=verbose, args_dict=minimize_args)
+
+        params = res[0]
+        return params
+
 
     def _latent_infer_control_to_minimize(self, params, grad = 0, bounds=None, eps=None, generator=None, x0=None,
                                           obs=None, fltr=None, Tf=None, Nf=None, a=None, scale=None):
@@ -605,9 +778,61 @@ cdef class SIR_type:
         return res[0]
 
 
+    def compute_hessian_latent(self, param_keys, init_fltr, maps, prior_mean, prior_stds, obs, fltr, Tf, Nf, contactMatrix,
+                                    beta_rescale=1, eps=1.e-3):
+        '''
+        Compute the Hessian over the parameters and initial conditions.
+
+        Parameters
+        ----------
+        maps: numpy.array
+            MAP parameter and initial condition estimate (computed for example with SIR_type.latent_inference).
+        obs: numpy.array
+            The observed data with the initial datapoint
+        fltr: boolean sequence or array
+            True for observed and False for unobserved.
+            e.g. if only Is is known for SIR with one age group, fltr = [False, False, True]
+        Tf: float
+            Total time of the trajectory
+        Nf: int
+            Total number of data points along the trajectory
+        contactMatrix: callable
+            A function that returns the contact matrix at time t (input).
+        eps: float, optional
+            Step size in the calculation of the Hessian
+
+        Returns
+        hess_params: numpy.array
+            The Hessian over parameters
+        hess_init: numpy.array
+            The Hessian over initial conditions
+        -------
+
+        '''
+        a, scale = pyross.utils.make_gamma_dist(prior_mean, prior_stds)
+        dim = maps.shape[0]
+        param_dim = dim - self.dim
+        map_params = maps[:param_dim]
+        map_x0 = maps[param_dim:]
+        a_params = a[:param_dim]
+        a_x0 = a[param_dim:]
+        scale_params = scale[:param_dim]
+        scale_x0 = scale[param_dim:]
+        hess_params = self.latent_hess_selected_params(param_keys, map_params, map_x0, a_params, scale_params,
+                                                obs, fltr, Tf, Nf, contactMatrix,
+                                                beta_rescale=beta_rescale, eps=eps)
+        hess_init = self.latent_hess_selected_init(init_fltr, map_x0, map_params, a_x0, scale_x0,
+                                                obs, fltr, Tf, Nf, contactMatrix,
+                                                eps=0.5/self.N)
+        return hess_params, hess_init
+
+
+
     def hessian_latent(self, maps, prior_mean, prior_stds, obs, fltr, Tf, Nf, contactMatrix,
                                     beta_rescale=1, eps=1.e-3):
         '''
+        DEPRECATED. Use compute_hessian_latent instead.
+
         Compute the Hessian over the parameters and initial conditions.
 
         Parameters
@@ -679,6 +904,34 @@ cdef class SIR_type:
         hess[:, 1] *= beta_rescale
         return hess
 
+    def latent_hess_selected_params(self, keys, map_params, x0, a_params, scale_params,
+                                    obs, fltr, Tf, Nf, contactMatrix,
+                                    beta_rescale=1, eps=1e-3):
+        cdef Py_ssize_t j
+        dim = map_params.shape[0]
+        hess = np.empty((dim, dim))
+        map_params[1] *= beta_rescale
+        def minuslogP(y):
+            y[1] /= beta_rescale
+            parameters = self.fill_params_dict(keys, y)
+            minuslogp = self.minus_logp_red(parameters, x0, obs[1:], fltr, Tf, Nf, contactMatrix)
+            minuslogp -= np.sum(gamma.logpdf(y, a_params, scale=scale_params))
+            y[1] *= beta_rescale
+            return minuslogp
+        g1 = approx_fprime(map_params, minuslogP, eps)
+        for j in range(dim):
+            temp = map_params[j]
+            map_params[j] += eps
+            g2 = approx_fprime(map_params, minuslogP, eps)
+            hess[:,j] = (g2 - g1)/eps
+            map_params[j] = temp
+        map_params[1] /= beta_rescale
+        hess[1, :] *= beta_rescale
+        hess[:, 1] *= beta_rescale
+        return hess
+
+
+
     def latent_hess_init(self, map_x0, params, a_x0, scale_x0,
                             obs, fltr, Tf, Nf, contactMatrix,
                                     eps=1e-6):
@@ -689,6 +942,28 @@ cdef class SIR_type:
         model = self.make_det_model(parameters)
         def minuslogP(y):
             minuslogp = self.obtain_log_p_for_traj_red(y, obs, fltr, Tf, Nf, model, contactMatrix)
+            minuslogp -= np.sum(gamma.logpdf(y, a_x0, scale=scale_x0))
+            return minuslogp
+        g1 = approx_fprime(map_x0, minuslogP, eps)
+        for j in range(dim):
+            temp = map_x0[j]
+            map_x0[j] += eps
+            g2 = approx_fprime(map_x0, minuslogP, eps)
+            hess[:,j] = (g2 - g1)/eps
+            map_x0[j] = temp
+        return hess
+
+    def latent_hess_init(self, init_fltr, map_x0, params, a_x0, scale_x0,
+                            obs, fltr, Tf, Nf, contactMatrix,
+                                    eps=1e-6):
+        cdef Py_ssize_t j
+        dim = map_x0.shape[0]
+        hess = np.empty((dim, dim))
+        parameters = self.make_params_dict(params)
+        model = self.make_det_model(parameters)
+        def minuslogP(y):
+            x0 = self.fill_initial_conditions(y, obs[0], init_fltr, fltr)
+            minuslogp = self.obtain_log_p_for_traj_matrix_fltr(x0, obs[1:], fltr, Tf, Nf, model, contactMatrix)
             minuslogp -= np.sum(gamma.logpdf(y, a_x0, scale=scale_x0))
             return minuslogp
         g1 = approx_fprime(map_x0, minuslogP, eps)
@@ -724,11 +999,21 @@ cdef class SIR_type:
             The total number of datapoints
         contactMatrix: callable
             A function that returns the contact matrix at time t (input).
+
+        returns
+        -------
+        minus_logp: float
+            -log(p) for the observed trajectory with the given parameters and initial conditions
         '''
         cdef double minus_log_p
         self.set_params(parameters)
         model = self.make_det_model(parameters)
-        minus_logp = self.obtain_log_p_for_traj_red(x0, obs, fltr, Tf, Nf, model, contactMatrix)
+        if fltr.ndim == 1:
+            print('Vector filter is deprecated. Use matrix filter instead.')
+            minus_logp = self.obtain_log_p_for_traj_red(x0, obs, fltr, Tf, Nf, model, contactMatrix)
+        else:
+            assert fltr.ndim == 2
+            minus_logp = self.obtain_log_p_for_traj_matrix_fltr(x0, obs, fltr, Tf, Nf, model, contactMatrix)
         return minus_logp
 
     def make_det_model(self, parameters):
@@ -743,8 +1028,40 @@ cdef class SIR_type:
             full_parameters[k] = params[i]
         return full_parameters
 
+    def keys_to_fltrs(self, init_keys):
+        # Currently not in use
+        init_keys_dict = self.get_init_keys_dict()
+        init_fltr = np.zeros(self.dim, dtype='bool')
+        for k in init_keys:
+            index = init_keys_dict[k]
+            init_fltr[index] = True
+        return init_fltr
+
+    def get_init_keys_dict(self):
+        # currently not used
+        pass # to be implemented in subclass
+
+    def fill_initial_conditions(self, double [:] partial_inits, double [:] obs_inits,
+                                        np.ndarray init_fltr, np.ndarray fltr):
+        cdef:
+            np.ndarray x0=np.empty(self.dim, dtype=DTYPE)
+            double [:] z, unknown_inits
+        z = np.subtract(obs_inits, np.dot(fltr[:, init_fltr], partial_inits))
+        unknown_inits = np.linalg.solve(fltr[:, np.invert(init_fltr)], z)
+        x0[init_fltr] = partial_inits
+        x0[np.invert(init_fltr)] = unknown_inits
+        return x0
+
+
     def set_params(self, parameters):
-        self.alpha = parameters['alpha']
+        self.alpha = np.zeros( self.M, dtype = DTYPE)
+        if np.size(parameters['alpha'])==1:
+            self.alpha = parameters['alpha']*np.ones(self.M)
+        elif np.size(parameters['alpha'])==self.M:
+            self.alpha = parameters['alpha']
+        else:
+            raise Exception('alpha can be a number or an array of size M')
+
         self.beta = parameters['beta']
         self.gIa = parameters['gIa']
         self.gIs = parameters['gIs']
@@ -779,6 +1096,26 @@ cdef class SIR_type:
         cov_red = full_cov[full_fltr][:, full_fltr]
         obs_flattened = np.ravel(obs)
         xm_red = np.ravel(np.compress(fltr, xm, axis=1))
+        dev=np.subtract(obs_flattened, xm_red)
+        cov_red_inv=np.linalg.inv(cov_red)
+        log_p= - (dev@cov_red_inv@dev)*(self.N/2)
+        sign,ldet=np.linalg.slogdet(cov_red)
+        if sign <0:
+            raise ValueError('Cov has negative determinant')
+        log_p -= (ldet-reduced_dim*log(self.N))/2 + (reduced_dim/2)*log(2*PI)
+        return -log_p
+
+    cdef double obtain_log_p_for_traj_matrix_fltr(self, double [:] x0, double [:, :] obs, np.ndarray fltr,
+                                            double Tf, Py_ssize_t Nf, model, contactMatrix):
+        cdef:
+            Py_ssize_t reduced_dim=(Nf-1)*fltr.shape[0]
+            double [:, :] xm
+            double [:] xm_red, dev, obs_flattened
+        xm, full_cov = self.obtain_full_mean_cov(x0, Tf, Nf, model, contactMatrix)
+        full_fltr = sparse.block_diag([fltr,]*(Nf-1))
+        cov_red = full_fltr@full_cov@np.transpose(full_fltr)
+        obs_flattened = np.ravel(obs)
+        xm_red = full_fltr@(np.ravel(xm))
         dev=np.subtract(obs_flattened, xm_red)
         cov_red_inv=np.linalg.inv(cov_red)
         log_p= - (dev@cov_red_inv@dev)*(self.N/2)
@@ -949,7 +1286,7 @@ cdef class SIR(SIR_type):
         3 * M.
     fi : np.array(M)
         Age group size as a fraction of total population
-    alpha : float
+    alpha : float or np.array(M)
         Fraction of infected who are asymptomatic.
     beta : float
         Rate of spread of infection.
@@ -982,6 +1319,9 @@ cdef class SIR(SIR_type):
             parameters = {'alpha':params[0], 'beta':params[1], 'gIa':params[2], 'gIs':params[3], 'fsa':self.fsa}
         return parameters
 
+    def get_init_keys_dict(self):
+        return {'S':0, 'Ia':1, 'Is':2}
+
     cdef lyapunov_fun(self, double t, double [:] sig, double [:, :] cheb_coef):
         cdef:
             double [:] x, s, Ia, Is
@@ -1005,34 +1345,36 @@ cdef class SIR(SIR_type):
     cdef jacobian(self, double [:] s, double [:] l):
         cdef:
             Py_ssize_t m, n, M=self.M
-            double alpha=self.alpha, balpha=1-self.alpha, gIa=self.gIa, gIs=self.gIs, fsa=self.fsa, beta=self.beta
+            double gIa=self.gIa, gIs=self.gIs, fsa=self.fsa, beta=self.beta
+            double [:] alpha=self.alpha, balpha=1-self.alpha
             double [:, :, :, :] J = self.J
             double [:, :] CM=self.CM
         for m in range(M):
             J[0, m, 0, m] = -l[m]
-            J[1, m, 0, m] = alpha*l[m]
-            J[2, m, 0, m] = balpha*l[m]
+            J[1, m, 0, m] = alpha[m]*l[m]
+            J[2, m, 0, m] = balpha[m]*l[m]
             for n in range(M):
                 J[0, m, 1, n] = -s[m]*beta*CM[m, n]
                 J[0, m, 2, n] = -s[m]*beta*CM[m, n]*fsa
-                J[1, m, 1, n] = alpha*s[m]*beta*CM[m, n]
-                J[1, m, 2, n] = alpha*s[m]*beta*CM[m, n]*fsa
-                J[2, m, 1, n] = balpha*s[m]*beta*CM[m, n]
-                J[2, m, 2, n] = balpha*s[m]*beta*CM[m, n]*fsa
+                J[1, m, 1, n] = alpha[m]*s[m]*beta*CM[m, n]
+                J[1, m, 2, n] = alpha[m]*s[m]*beta*CM[m, n]*fsa
+                J[2, m, 1, n] = balpha[m]*s[m]*beta*CM[m, n]
+                J[2, m, 2, n] = balpha[m]*s[m]*beta*CM[m, n]*fsa
             J[1, m, 1, m] -= gIa
             J[2, m, 2, m] -= gIs
 
     cdef noise_correlation(self, double [:] s, double [:] Ia, double [:] Is, double [:] l):
         cdef:
             Py_ssize_t m, M=self.M
-            double alpha=self.alpha, balpha=1-self.alpha, gIa=self.gIa, gIs=self.gIs
+            double gIa=self.gIa, gIs=self.gIs
+            double [:] alpha=self.alpha, balpha=1-self.alpha
             double [:, :, :, :] B = self.B
         for m in range(M): # only fill in the upper triangular form
             B[0, m, 0, m] = l[m]*s[m]
-            B[0, m, 1, m] =  - alpha*l[m]*s[m]
-            B[1, m, 1, m] = alpha*l[m]*s[m] + gIa*Ia[m]
-            B[0, m, 2, m] = - balpha*l[m]*s[m]
-            B[2, m, 2, m] = balpha*l[m]*s[m] + gIs*Is[m]
+            B[0, m, 1, m] =  - alpha[m]*l[m]*s[m]
+            B[1, m, 1, m] = alpha[m]*l[m]*s[m] + gIa*Ia[m]
+            B[0, m, 2, m] = - balpha[m]*l[m]*s[m]
+            B[2, m, 2, m] = balpha[m]*l[m]*s[m] + gIs*Is[m]
         self.B_vec = self.B.reshape((self.dim, self.dim))[(self.rows, self.cols)]
 
     cpdef integrate(self, double [:] x0, double t1, double t2, Py_ssize_t steps, model, contactMatrix):
@@ -1063,7 +1405,7 @@ cdef class SEIR(SIR_type):
         4 * M.
     fi : np.array(M)
         Age group size as a fraction of total population
-    alpha : float
+    alpha : float or np.array(M)
         Fraction of infected who are asymptomatic.
     beta : float
         Rate of spread of infection.
@@ -1106,6 +1448,9 @@ cdef class SEIR(SIR_type):
                             'gIs':params[3], 'gE': params[4], 'fsa':self.fsa}
         return parameters
 
+    def get_init_keys_dict(self):
+        return {'S':0, 'E':1, 'Ia':2, 'Is':3}
+
 
     cdef lyapunov_fun(self, double t, double [:] sig, double [:, :] cheb_coef):
         cdef:
@@ -1130,17 +1475,17 @@ cdef class SEIR(SIR_type):
     cdef jacobian(self, double [:] s, double [:] l):
         cdef:
             Py_ssize_t m, n, M=self.M
-            double alpha=self.alpha, balpha=1-self.alpha, gIa=self.gIa, gIs=self.gIs,
-            double gE=self.gE, fsa=self.fsa, beta=self.beta
+            double gIa=self.gIa, gIs=self.gIs, gE=self.gE, fsa=self.fsa, beta=self.beta
+            double [:] alpha=self.alpha, balpha=1-self.alpha
             double [:, :, :, :] J = self.J
             double [:, :] CM=self.CM
         for m in range(M):
             J[0, m, 0, m] = -l[m]
             J[1, m, 0, m] = l[m]
             J[1, m, 1, m] = - gE
-            J[2, m, 1, m] = alpha*gE
+            J[2, m, 1, m] = alpha[m]*gE
             J[2, m, 2, m] = - gIa
-            J[3, m, 1, m] = balpha*gE
+            J[3, m, 1, m] = balpha[m]*gE
             J[3, m, 3, m] = - gIs
             for n in range(M):
                 J[0, m, 2, n] = -s[m]*beta*CM[m, n]
@@ -1151,16 +1496,17 @@ cdef class SEIR(SIR_type):
     cdef noise_correlation(self, double [:] s, double [:] e, double [:] Ia, double [:] Is, double [:] l):
         cdef:
             Py_ssize_t m, M=self.M
-            double alpha=self.alpha, balpha=1-self.alpha, gIa=self.gIa, gIs=self.gIs, gE=self.gE
+            double gIa=self.gIa, gIs=self.gIs, gE=self.gE
+            double [:] alpha=self.alpha, balpha=1-self.alpha
             double [:, :, :, :] B = self.B
         for m in range(M): # only fill in the upper triangular form
             B[0, m, 0, m] = l[m]*s[m]
             B[0, m, 1, m] =  - l[m]*s[m]
             B[1, m, 1, m] = l[m]*s[m] + gE*e[m]
-            B[1, m, 2, m] = -alpha*gE*e[m]
-            B[1, m, 3, m] = -balpha*gE*e[m]
-            B[2, m, 2, m] = alpha*gE*e[m]+gIa*Ia[m]
-            B[3, m, 3, m] = balpha*gE*e[m]+gIs*Is[m]
+            B[1, m, 2, m] = -alpha[m]*gE*e[m]
+            B[1, m, 3, m] = -balpha[m]*gE*e[m]
+            B[2, m, 2, m] = alpha[m]*gE*e[m]+gIa*Ia[m]
+            B[3, m, 3, m] = balpha[m]*gE*e[m]+gIs*Is[m]
         self.B_vec = self.B.reshape((self.dim, self.dim))[(self.rows, self.cols)]
 
     cpdef integrate(self, double [:] x0, double t1, double t2, Py_ssize_t steps, model, contactMatrix):
@@ -1206,7 +1552,7 @@ cdef class SEAI5R(SIR_type):
         8 * M.
     fi : np.array(M)
         Age group size as a fraction of total population
-    alpha : float
+    alpha : float or np.array(M)
         Fraction of infected who are asymptomatic.
     beta : float
         Rate of spread of infection.
@@ -1319,6 +1665,9 @@ cdef class SEAI5R(SIR_type):
                       'mm': self.mm}
         return parameters
 
+    def get_init_keys_dict(self):
+        return {'S':0, 'E':1, 'A':2, 'Ia':3, 'Is':4, 'Ih':5, 'Ic':6, 'Im':7}
+
 
     cdef lyapunov_fun(self, double t, double [:] sig, double [:, :] cheb_coef):
         cdef:
@@ -1348,8 +1697,9 @@ cdef class SEAI5R(SIR_type):
     cdef jacobian(self, double [:] s, double [:] l):
         cdef:
             Py_ssize_t m, n, M=self.M
-            double alpha=self.alpha, balpha=1-self.alpha, gIa=self.gIa, gIs=self.gIs, gIh=self.gIh, gIc=self.gIc
+            double gIa=self.gIa, gIs=self.gIs, gIh=self.gIh, gIc=self.gIc
             double gE=self.gE, gA=self.gA, fsa=self.fsa, fh=self.fh, beta=self.beta
+            double [:] alpha=self.alpha, balpha=1-self.alpha
             double [:] hh=self.hh, cc=self.cc, mm=self.mm
             double [:, :, :, :] J = self.J
             double [:, :] CM=self.CM
@@ -1359,9 +1709,9 @@ cdef class SEAI5R(SIR_type):
             J[1, m, 1, m] = - gE
             J[2, m, 1, m] = gE
             J[2, m, 2, m] = - gA
-            J[3, m, 2, m] = alpha*gA
+            J[3, m, 2, m] = alpha[m]*gA
             J[3, m, 3, m] = - gIa
-            J[4, m, 2, m] = balpha*gA
+            J[4, m, 2, m] = balpha[m]*gA
             J[4, m, 4, m] = -gIs
             J[5, m, 4, m] = hh[m]*gIs
             J[5, m, 5, m] = -gIh
@@ -1382,7 +1732,8 @@ cdef class SEAI5R(SIR_type):
     cdef noise_correlation(self, double [:] s, double [:] e, double [:] a, double [:] Ia, double [:] Is, double [:] Ih, double [:] Ic, double [:] l):
         cdef:
             Py_ssize_t m, M=self.M
-            double alpha=self.alpha, balpha=1-self.alpha, gIa=self.gIa, gIs=self.gIs, gIh=self.gIh, gIc=self.gIc, gE=self.gE, gA=self.gA
+            double gIa=self.gIa, gIs=self.gIs, gIh=self.gIh, gIc=self.gIc, gE=self.gE, gA=self.gA
+            double [:] alpha=self.alpha, balpha=1-self.alpha
             double [:] mm=self.mm, cc=self.cc, hh=self.hh
             double [:, :, :, :] B = self.B
         for m in range(M): # only fill in the upper triangular form
@@ -1391,10 +1742,10 @@ cdef class SEAI5R(SIR_type):
             B[1, m, 1, m] = l[m]*s[m] + gE*e[m]
             B[1, m, 2, m] = -gE*e[m]
             B[2, m, 2, m] = gE*e[m]+gA*a[m]
-            B[2, m, 3, m] = -alpha*gA*a[m]
-            B[2, m, 4, m] = -balpha*gA*a[m]
-            B[3, m, 3, m] = alpha*gA*a[m]+gIa*Ia[m]
-            B[4, m, 4, m] = balpha*gA*a[m] + gIs*Is[m]
+            B[2, m, 3, m] = -alpha[m]*gA*a[m]
+            B[2, m, 4, m] = -balpha[m]*gA*a[m]
+            B[3, m, 3, m] = alpha[m]*gA*a[m]+gIa*Ia[m]
+            B[4, m, 4, m] = balpha[m]*gA*a[m] + gIs*Is[m]
             B[4, m, 5, m] = -hh[m]*gIs*Is[m]
             B[5, m, 5, m] = hh[m]*gIs*Is[m] + gIh*Ih[m]
             B[5, m, 6, m] = -cc[m]*gIh*Ih[m]
@@ -1441,7 +1792,7 @@ cdef class SEAIRQ(SIR_type):
         6 * M.
     fi : np.array(M)
         Age group size as a fraction of total population
-    alpha : float
+    alpha : float or np.array(M)
         Fraction of infected who are asymptomatic.
     beta : float
         Rate of spread of infection.
@@ -1476,6 +1827,9 @@ cdef class SEAIRQ(SIR_type):
 
     def __init__(self, parameters, M, fi, N, steps):
         super().__init__(parameters, 6, M, fi, N, steps)
+
+    def get_init_keys_dict(self):
+        return {'S':0, 'E':1, 'A':2, 'Ia':3, 'Is':4, 'Q':5}
 
     def _infer_control_to_minimize(self, params, grad=0, x=None, Tf=None, Nf=None,
                                     generator=None, a=None, scale=None):
@@ -1637,9 +1991,9 @@ cdef class SEAIRQ(SIR_type):
     cdef jacobian(self, double [:] s, double [:] l):
         cdef:
             Py_ssize_t m, n, M=self.M
-            double alpha=self.alpha, balpha=1-self.alpha, beta=self.beta
             double gE=self.gE, gA=self.gA, gIa=self.gIa, gIs=self.gIs, fsa=self.fsa
-            double tE=self.tE, tA=self.tE, tIa=self.tIa, tIs=self.tIs
+            double tE=self.tE, tA=self.tE, tIa=self.tIa, tIs=self.tIs, beta=self.beta
+            double [:] alpha=self.alpha, balpha=1-self.alpha
             double [:, :, :, :] J = self.J
             double [:, :] CM=self.CM
         for m in range(M):
@@ -1648,9 +2002,9 @@ cdef class SEAIRQ(SIR_type):
             J[1, m, 1, m] = - gE - tE
             J[2, m, 1, m] = gE
             J[2, m, 2, m] = - gA - tE
-            J[3, m, 2, m] = alpha*gA
+            J[3, m, 2, m] = alpha[m]*gA
             J[3, m, 3, m] = - gIa - tIa
-            J[4, m, 2, m] = balpha*gA
+            J[4, m, 2, m] = balpha[m]*gA
             J[4, m, 4, m] = -gIs - tIs
             J[5, m, 1, m] = tE
             J[5, m, 2, m] = tA
@@ -1667,9 +2021,9 @@ cdef class SEAIRQ(SIR_type):
     cdef noise_correlation(self, double [:] s, double [:] e, double [:] a, double [:] Ia, double [:] Is, double [:] q, double [:] l):
         cdef:
             Py_ssize_t m, M=self.M
-            double alpha=self.alpha, balpha=1-self.alpha, beta=self.beta
-            double gIa=self.gIa, gIs=self.gIs, gE=self.gE, gA=self.gA
+            double beta=self.beta, gIa=self.gIa, gIs=self.gIs, gE=self.gE, gA=self.gA
             double tE=self.tE, tA=self.tE, tIa=self.tIa, tIs=self.tIs
+            double [:] alpha=self.alpha, balpha=1-self.alpha
             double [:, :, :, :] B = self.B
         for m in range(M): # only fill in the upper triangular form
             B[0, m, 0, m] = l[m]*s[m]
@@ -1677,10 +2031,10 @@ cdef class SEAIRQ(SIR_type):
             B[1, m, 1, m] = l[m]*s[m] + (gE+tE)*e[m]
             B[1, m, 2, m] = -gE*e[m]
             B[2, m, 2, m] = gE*e[m]+(gA+tA)*a[m]
-            B[2, m, 3, m] = -alpha*gA*a[m]
-            B[2, m, 4, m] = -balpha*gA*a[m]
-            B[3, m, 3, m] = alpha*gA*a[m]+(gIa+tIa)*Ia[m]
-            B[4, m, 4, m] = balpha*gA*a[m] + (gIs+tIs)*Is[m]
+            B[2, m, 3, m] = -alpha[m]*gA*a[m]
+            B[2, m, 4, m] = -balpha[m]*gA*a[m]
+            B[3, m, 3, m] = alpha[m]*gA*a[m]+(gIa+tIa)*Ia[m]
+            B[4, m, 4, m] = balpha[m]*gA*a[m] + (gIs+tIs)*Is[m]
             B[1, m, 5, m] = -tE*e[m]
             B[2, m, 5, m] = -tA*a[m]
             B[3, m, 5, m] = -tIa*Ia[m]
@@ -1700,5 +2054,151 @@ cdef class SEAIRQ(SIR_type):
         Is = x0[4*M:5*M]
         q = x0[5*M:]
         data = model.simulate(s, e, a, Ia, Is, q, contactMatrix, t2, steps, Ti=t1)
+        sol = data['X']
+        return sol
+
+cdef class Spp(SIR_type):
+    cdef:
+        int [:, :] linear_terms
+        int [:, :] infection_terms
+        double [:, :] parameters
+        readonly list param_keys
+        readonly dict class_index_dict
+        Py_ssize_t nParams
+        pyross.deterministic.Spp det_model
+
+
+    def __init__(self, model_spec, parameters, M, fi, N, steps):
+        self.param_keys = list(parameters.keys())
+        res = pyross.utils.parse_model_spec(model_spec, self.param_keys)
+        self.nClass = res[0]
+        self.class_index_dict = res[1]
+        self.linear_terms = res[2]
+        self.infection_terms = res[3]
+        super().__init__(parameters, self.nClass, M, fi, N, steps)
+        self.det_model = pyross.deterministic.Spp(model_spec, parameters, M, fi)
+
+
+    def set_params(self, parameters):
+        cdef double [:] param_array
+        nParams = len(parameters)
+        self.parameters = np.empty((nParams, self.M), dtype=DTYPE)
+        for (i, param) in enumerate(parameters.values()):
+            if type(param) == list:
+                param = np.array(param)
+
+            if type(param) == np.ndarray:
+                if param.size != self.M:
+                    raise Exception("Parameter array size must be equal to M.")
+            else:
+                param = np.full(self.M, param)
+            param_array = param
+            self.parameters[i] = param_array
+
+    def make_det_model(self, parameters):
+        # small hack to make this class work with SIR_type
+        self.det_model.update_model_parameters(parameters)
+        return self.det_model
+
+
+    def make_params_dict(self, params=None):
+        param_dict = {k:self.parameters[i] for (i, k) in enumerate(self.param_keys)}
+        return param_dict
+
+    cdef lyapunov_fun(self, double t, double [:] sig, double [:, :] cheb_coef):
+        cdef:
+            double [:] x
+            double [:, :] CM=self.CM
+            int [:, :] infection_terms=self.infection_terms
+            double infection_rate
+            Py_ssize_t m, n, i, infective_index, index, M=self.M, num_of_infection_terms=infection_terms.shape[0]
+        x = chebval(t, cheb_coef)
+        cdef double [:, :] l=np.zeros((num_of_infection_terms, M), dtype=DTYPE)
+        self.B = np.zeros((self.nClass, self.M, self.nClass, self.M), dtype=DTYPE)
+        self.J = np.zeros((self.nClass, self.M, self.nClass, self.M), dtype=DTYPE)
+
+        for i in range(num_of_infection_terms):
+            infective_index = infection_terms[i, 1]
+            for m in range(M):
+                for n in range(M):
+                    index = n + M*infective_index
+                    l[i, m] += CM[m,n]*x[index]
+        self.jacobian(x, l)
+        self.noise_correlation(x, l)
+        self.flatten_lyaponuv()
+        self.compute_dsigdt(sig)
+
+    cpdef jacobian(self, double [:] x, double [:, :] l):
+        cdef:
+            Py_ssize_t i, m, n, M=self.M
+            Py_ssize_t rate_index, infective_index, product_index, reagent_index, S_index=self.class_index_dict['S']
+            double [:, :, :, :] J = self.J
+            double [:, :] CM=self.CM
+            double [:, :] parameters=self.parameters
+            int [:, :] linear_terms=self.linear_terms, infection_terms=self.infection_terms
+        # infection terms
+        for i in range(infection_terms.shape[0]):
+            product_index = infection_terms[i, 2]
+            infective_index = infection_terms[i, 1]
+            rate_index = infection_terms[i, 0]
+            rate = parameters[rate_index]
+            for m in range(M):
+                J[S_index, m, S_index, m] -= rate[m]*l[i, m]
+                if product_index>-1:
+                    J[product_index, m, S_index, m] += rate[m]*l[i, m]
+                for n in range(M):
+                    J[S_index, m, infective_index, n] -= x[S_index*M+m]*rate[m]*CM[m, n]
+                    if product_index>-1:
+                        J[product_index, m, infective_index, n] += x[S_index*M+m]*rate[m]*CM[m, n]
+        for i in range(linear_terms.shape[0]):
+            product_index = linear_terms[i, 2]
+            reagent_index = linear_terms[i, 1]
+            rate_index = linear_terms[i, 0]
+            rate = parameters[rate_index]
+            for m in range(M):
+                J[reagent_index, m, reagent_index, m] -= rate[m]
+                if product_index>-1:
+                    J[product_index, m, reagent_index, m] += rate[m]
+
+    cpdef noise_correlation(self, double [:] x, double [:, :] l):
+        cdef:
+            Py_ssize_t i, m, n, M=self.M
+            Py_ssize_t rate_index, infective_index, product_index, reagent_index, S_index=self.class_index_dict['S']
+            double [:, :, :, :] B=self.B
+            double [:, :] CM=self.CM
+            double [:, :] parameters=self.parameters
+            int [:, :] linear_terms=self.linear_terms, infection_terms=self.infection_terms
+            double [:] s, reagent
+        s = x[S_index*M:(S_index+1)*M]
+        for i in range(infection_terms.shape[0]):
+            product_index = infection_terms[i, 2]
+            infective_index = infection_terms[i, 1]
+            rate_index = infection_terms[i, 0]
+            rate = parameters[rate_index]
+            for m in range(M):
+                B[S_index, m, S_index, m] += rate[m]*l[i, m]*s[m]
+                if product_index>-1:
+                    B[S_index, m, product_index, m] -=  rate[m]*l[i, m]*s[m]
+                    B[product_index, m, product_index, m] += rate[m]*l[i, m]*s[m]
+                    B[product_index, m, S_index, m] -= rate[m]*l[i, m]*s[m]
+
+        for i in range(linear_terms.shape[0]):
+            product_index = linear_terms[i, 2]
+            reagent_index = linear_terms[i, 1]
+            reagent = x[reagent_index*M:(reagent_index+1)*M]
+            rate_index = linear_terms[i, 0]
+            rate = parameters[rate_index]
+            for m in range(M): # only fill in the upper triangular form
+                B[reagent_index, m, reagent_index, m] += rate[m]*reagent[m]
+                if product_index>-1:
+                    B[product_index, m, product_index, m] += rate[m]*reagent[m]
+                    B[reagent_index, m, product_index, m] += -rate[m]*reagent[m]
+                    B[product_index, m, reagent_index, m] += -rate[m]*reagent[m]
+        self.B_vec = self.B.reshape((self.dim, self.dim))[(self.rows, self.cols)]
+
+    cpdef integrate(self, double [:] x0, double t1, double t2, Py_ssize_t steps, model, contactMatrix):
+        cdef:
+            double [:, :] sol
+        data = model.simulate(np.array(x0), contactMatrix, t2, steps, Ti=t1)
         sol = data['X']
         return sol
